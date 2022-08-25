@@ -10,14 +10,14 @@ RG_NAME=aks-demos
 CLUSTER_NAME=aks-demos
 LOCATION=australiasoutheast
 
-# For access to the public preview feature
+# Register the feature flag for access to the public preview feature
 az feature register --name EnableOIDCIssuerPreview --namespace Microsoft.ContainerService
 az feature list -o table --query "[?contains(name, 'Microsoft.ContainerService/EnableOIDCIssuerPreview')].{Name:name,State:properties.state}"
 az provider register --namespace Microsoft.ContainerService
 
 az extension update --name aks-preview
 
-# Create an AKS cluster
+# Create an AKS cluster with OIDC issuer enabled
 az group create -n $RG_NAME -l $LOCATION
 az aks create --resource-group $RG_NAME --name $CLUSTER_NAME --enable-oidc-issuer --generate-ssh-keys
 az aks get-credentials --resource-group $RG_NAME --name $CLUSTER_NAME --overwrite-existing
@@ -29,6 +29,7 @@ echo $OIDC_ISSUER_URL
 
 AZURE_TENANT_ID="$(az account show --query tenantId -o tsv)"
 
+# Install the required Azure Workload Identity mutating admission webhook controller
 helm repo add azure-workload-identity https://azure.github.io/azure-workload-identity/charts
 helm repo update
 helm install workload-identity-webhook azure-workload-identity/workload-identity-webhook \
@@ -38,6 +39,7 @@ helm install workload-identity-webhook azure-workload-identity/workload-identity
 
 kubectl get pod -n azure-workload-identity-system
 
+# Install the optional AZWI CLI helper tool
 wget https://github.com/Azure/azure-workload-identity/releases/download/v0.12.0/azwi-v0.12.0-linux-amd64.tar.gz
 tar xzvf azwi-v0.12.0-linux-amd64.tar.gz azwi
 chmod +x azwi
@@ -51,10 +53,10 @@ export KEYVAULT_SECRET_NAME="my-secret"
 export RESOURCE_GROUP="azwi-quickstart-$(openssl rand -hex 2)"
 export LOCATION="australiasoutheast"
 
-# environment variables for the AAD application
+# Environment variables for the AAD application
 export APPLICATION_NAME="aadwidemo"
 
-# environment variables for the Kubernetes service account & federated identity credential
+# Environment variables for the Kubernetes service account & federated identity credential
 export SERVICE_ACCOUNT_NAMESPACE="default"
 export SERVICE_ACCOUNT_NAME="workload-identity-sa"
 export SERVICE_ACCOUNT_ISSUER=$OIDC_ISSUER_URL
@@ -90,7 +92,6 @@ az keyvault set-policy --name "${KEYVAULT_NAME}" \
 #   --service-account-namespace "${SERVICE_ACCOUNT_NAMESPACE}" \
 #   --service-account-name "${SERVICE_ACCOUNT_NAME}"
 
-
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: ServiceAccount
@@ -105,7 +106,7 @@ EOF
 
 kubectl get sa ${SERVICE_ACCOUNT_NAME} -o yaml
 
-# Establish federated identity credential between the AAD application and the service account issuer & subject
+# Establish federated identity credential for trust between the AAD application and the service account issuer & subject
 
 # With AZWI:
 # azwi serviceaccount create phase federated-identity \
@@ -131,9 +132,12 @@ EOF
 
 az rest --method POST --uri "https://graph.microsoft.com/beta/applications/${APPLICATION_OBJECT_ID}/federatedIdentityCredentials" --body @body.json
 
+# Check the federated credential assigned to the app registration in Azure Portal by searching with its client ID
+echo APPLICATION_CLIENT_ID=$APPLICATION_CLIENT_ID
+
 # Deploy workload(s)
 
-# Demo 1
+# Demo 1 - MSAL with Golang
 
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
@@ -156,18 +160,13 @@ spec:
 EOF
 
 # To check whether all properties are injected properly by the webhook:
+kubectl get pod quick-start
 kubectl describe pod quick-start
 
 # To verify that pod is able to get a token and access the secret from the Key Vault:
 kubectl logs quick-start
 
-kubectl delete pod quick-start
-kubectl delete sa "${SERVICE_ACCOUNT_NAME}" --namespace "${SERVICE_ACCOUNT_NAMESPACE}"
-
-az group delete --name "${RESOURCE_GROUP}"
-az ad sp delete --id "${APPLICATION_CLIENT_ID}"
-
-# Demo 2
+# Demo 2 - Azure CLI
 
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
@@ -204,24 +203,25 @@ spec:
         kubernetes.io/os: linux
 EOF
 
-
+# For demo purposes, grant read access to the Resource Group containing the Key Vault secret for Azure CLI access
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 az role assignment create --assignee $APPLICATION_CLIENT_ID --role "Reader" --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP
 
+kubectl get $(kubectl get pod -l app=azcli -o name)
 kubectl describe $(kubectl get pod -l app=azcli -o name)
 
 kubectl exec -ti $(kubectl get pod -l app=azcli -o name) -- /bin/bash
 cat $AZURE_FEDERATED_TOKEN_FILE
 # ==> eyJ<....snip...>
+# Paste the JWT into https://jwt.io to decode it
 
 az login --federated-token "$(cat $AZURE_FEDERATED_TOKEN_FILE)" --debug \
 --service-principal -u $AZURE_CLIENT_ID -t $AZURE_TENANT_ID
 
 az keyvault list -o table
 az keyvault secret show --vault-name azwi-kv-ba1b --name my-secret
+exit
 ```
-
-Paste the JWT token into https://jwt.io
 
 Check OpenID Configuration in the AKS cluster:
 
@@ -233,6 +233,8 @@ Cleanup
 -------
 
 ```sh
+# ----- Minimum cleanup to repeat demo -----
+
 # Demo 1
 kubectl delete pod quick-start
 
@@ -241,6 +243,8 @@ kubectl delete deployment azcli-deployment
 
 # Service account
 kubectl delete sa "${SERVICE_ACCOUNT_NAME}" --namespace "${SERVICE_ACCOUNT_NAMESPACE}"
+
+# ----- Full cleanup -----
 
 # Cluster
 az group delete --name "${RESOURCE_GROUP}"
